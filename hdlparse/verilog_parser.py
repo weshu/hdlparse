@@ -4,7 +4,7 @@
 from __future__ import print_function
 
 import re, os, io, ast, pprint, collections
-from minilexer import MiniLexer
+from .minilexer import MiniLexer
 
 '''Verilog documentation parser'''
 
@@ -18,6 +18,7 @@ verilog_tokens = {
   'module': [
     (r'parameter\s*(signed|integer|realtime|real|time)?\s*(\[[^]]+\])?', 'parameter_start', 'parameters'),
     (r'(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[^]]+\])?', 'module_port_start', 'module_port'),
+    (r'\b(\w+)\s+(\w+)\s*\(', 'submodule_start', 'submodule'),
     (r'endmodule', 'end_module', '#pop'),
     (r'/\*', 'block_comment', 'block_comment'),
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
@@ -25,7 +26,8 @@ verilog_tokens = {
   ],
   'parameters': [
     (r'\s*parameter\s*(signed|integer|realtime|real|time)?\s*(\[[^]]+\])?', 'parameter_start'),
-    (r'\s*(\w+)[^),;]*', 'param_item'),
+    (r'\s*(\w+)\s*=\s*([^,;\s]+)\s*', 'param_item_with_value'),
+    (r'\s*(\w+)\s*', 'param_item'),
     (r',', None),
     (r'[);]', None, '#pop'),
   ],
@@ -36,7 +38,12 @@ verilog_tokens = {
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
     (r'//.*\n', None),
   ],
-
+  'submodule': [
+    (r'\.(\w+)\s*\(\s*(\w+)\s*\)', 'submodule_port_connection'),
+    (r'\);', 'end_submodule', '#pop'),
+    (r',', None),
+    (r'//.*\n', None),
+  ],
   'block_comment': [
     (r'\*/', 'end_comment', '#pop'),
   ],
@@ -73,15 +80,30 @@ class VerilogParameter(object):
   def __repr__(self):
     return "VerilogParameter('{}')".format(self.name)
 
+class VerilogSubModule(object):
+  '''Submodule instance in a module'''
+  def __init__(self, module_type, instance_name, port_connections=None, desc=None):
+    self.module_type = module_type
+    self.instance_name = instance_name
+    self.port_connections = port_connections if port_connections is not None else {}
+    self.desc = desc
+
+  def __str__(self):
+    return f"{self.instance_name} ({self.module_type})"
+
+  def __repr__(self):
+    return f"VerilogSubModule('{self.instance_name}', '{self.module_type}')"
+
 class VerilogModule(VerilogObject):
   '''Module definition'''
-  def __init__(self, name, ports, generics=None, sections=None, desc=None):
+  def __init__(self, name, ports, generics=None, sections=None, submodules=None, desc=None):
     VerilogObject.__init__(self, name, desc)
     self.kind = 'module'
     # Verilog params
     self.generics = generics if generics is not None else []
     self.ports = ports
     self.sections = sections if sections is not None else {}
+    self.submodules = submodules if submodules is not None else []
   def __repr__(self):
     return "VerilogModule('{}') {}".format(self.name, self.ports)
 
@@ -113,7 +135,7 @@ def parse_verilog(text):
   kind = None
   saved_type = None
   mode = 'input'
-  ptype = 'wire'
+  ptype = 'wire'  # Default type
 
   metacomments = []
   parameters = []
@@ -125,6 +147,11 @@ def parse_verilog(text):
   port_param_index = 0
   last_item = None
   array_range_start_pos = 0
+
+  # Submodule parsing variables
+  current_submodule = None
+  submodule_port_connections = {}
+  submodules = []
 
   objects = []
 
@@ -146,28 +173,51 @@ def parse_verilog(text):
       param_items = []
       sections = []
       port_param_index = 0
+      submodules = []
+      ptype = 'wire'  # Reset default type for new module
+
+    elif action == 'submodule_start':
+      module_type, instance_name = groups
+      current_submodule = VerilogSubModule(module_type, instance_name)
+      submodule_port_connections = {}
+
+    elif action == 'submodule_port_connection':
+      port_name, connection = groups
+      submodule_port_connections[port_name] = connection
+
+    elif action == 'end_submodule':
+      current_submodule.port_connections = submodule_port_connections
+      submodules.append(current_submodule)
+      current_submodule = None
 
     elif action == 'parameter_start':
       net_type, vec_range = groups
 
-      new_ptype = ''
+      new_ptype = 'wire'  # Default type for parameters
       if net_type is not None:
-        new_ptype += net_type
+        new_ptype = net_type
 
       if vec_range is not None:
         new_ptype += ' ' + vec_range
 
       ptype = new_ptype
 
+    elif action == 'param_item_with_value':
+      name, value = groups
+      value = value.strip()  # Remove any trailing whitespace
+      generics.append(VerilogParameter(name, 'in', ptype, value))
+
     elif action == 'param_item':
-      generics.append(VerilogParameter(groups[0], 'in', ptype))
+      name = groups[0].strip()  # Remove any trailing whitespace
+      if name and not any(p.name == name for p in generics):  # Avoid duplicates
+        generics.append(VerilogParameter(name, 'in', ptype))
 
     elif action == 'module_port_start':
       new_mode, net_type, signed, vec_range = groups
 
-      new_ptype = ''
+      new_ptype = 'wire'  # Default type for ports
       if net_type is not None:
-        new_ptype += net_type
+        new_ptype = net_type
 
       if signed is not None:
         new_ptype += ' ' + signed
@@ -198,7 +248,7 @@ def parse_verilog(text):
       for i in param_items:
         ports[i] = VerilogParameter(i, mode, ptype)
 
-      vobj = VerilogModule(name, ports.values(), generics, dict(sections), metacomments)
+      vobj = VerilogModule(name, ports.values(), generics, dict(sections), submodules, metacomments)
       objects.append(vobj)
       last_item = None
       metacomments = []
